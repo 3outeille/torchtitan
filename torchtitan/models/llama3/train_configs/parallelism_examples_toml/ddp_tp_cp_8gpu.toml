@@ -1,0 +1,22 @@
+# DDP + TP + CP configuration for an 8-GPU setup.
+[job]
+dump_folder = "./outputs"
+description = "Llama 3 debug training with DDP+TP+CP on 8 GPUs"
+[model]
+name = "llama3"
+flavor = "debugmodel"
+tokenizer_path = "./tests/assets/tokenizer"
+[optimizer]
+name = "AdamW"
+lr = 8e-4
+[training]
+local_batch_size = 8
+seq_len = 2048
+steps = 10
+dataset = "c4_test"
+[parallelism]
+data_parallel_replicate_degree = 2
+tensor_parallel_degree = 2
+context_parallel_degree = 2
+[checkpoint]
+enable_checkpoint = false 

@@ -1,0 +1,41 @@
+# DDP + TP + PP configuration for an 8-GPU setup.
+# 2-way for each dimension. Very high memory usage.
+
+[job]
+dump_folder = "./outputs"
+description = "Llama 3 debug training with DDP+TP+PP on 8 GPUs"
+print_args = false
+use_for_integration_test = true
+
+[model]
+name = "llama3"
+flavor = "debugmodel"
+tokenizer_path = "./tests/assets/tokenizer"
+
+[optimizer]
+name = "AdamW"
+lr = 8e-4
+eps = 1e-8
+
+[training]
+local_batch_size = 8
+seq_len = 2048
+max_norm = 1.0
+steps = 10
+compile = false
+dataset = "c4_test"
+
+[parallelism]
+data_parallel_replicate_degree = 2
+data_parallel_shard_degree = 1
+tensor_parallel_degree = 2
+pipeline_parallel_degree = 2
+context_parallel_degree = 1
+expert_parallel_degree = 1
+module_fqns_per_model_part = [
+    ["tok_embeddings", "layers.0", "layers.1"],
+    ["layers.2", "layers.3", "norm", "output"],
+]
+
+[checkpoint]
+enable_checkpoint = false 
