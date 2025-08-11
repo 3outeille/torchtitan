@@ -3,12 +3,12 @@
 
 [job]
 dump_folder = "./outputs"
-description = "Llama 3 debug training with FSDP+EP on 4 GPUs"
+description = "Llama 4 debug training with FSDP+EP on 4 GPUs"
 print_args = false
 use_for_integration_test = true
 
 [model]
-name = "llama3"
+name = "llama4"
 flavor = "debugmodel"
 tokenizer_path = "./tests/assets/tokenizer"
 
@@ -16,6 +16,9 @@ tokenizer_path = "./tests/assets/tokenizer"
 name = "AdamW"
 lr = 8e-4
 eps = 1e-8
+
+[metrics]
+log_freq = 1
 
 [training]
 local_batch_size = 8
