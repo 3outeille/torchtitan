@@ -9,6 +9,7 @@ import torch.nn as nn
 
 from torchtitan.config import JobConfig, TORCH_DTYPE_MAP
 from torchtitan.distributed import ParallelDims
+from torchtitan.distributed.tensor_parallel import maybe_enable_async_tp
 from torchtitan.models.llama3.infra.parallelize import apply_ac, apply_tp
 from torchtitan.tools.logging import logger
 
@@ -38,12 +39,6 @@ def parallelize_llama(
         """
 
     if parallel_dims.tp_enabled:
-        if (
-            job_config.parallelism.enable_async_tensor_parallel
-            and not job_config.training.compile
-        ):
-            raise RuntimeError("Async TP requires --training.compile")
-
         enable_float8_linear = "float8" in job_config.model.converters
         float8_is_rowwise = job_config.float8.recipe_name in (
             "rowwise",
@@ -61,8 +56,8 @@ def parallelize_llama(
             tp_mesh,
             loss_parallel=not job_config.parallelism.disable_loss_parallel,
             enable_float8_tensorwise_tp=enable_float8_tensorwise_tp,
-            enable_async_tp=job_config.parallelism.enable_async_tensor_parallel,
         )
+        maybe_enable_async_tp(job_config, tp_mesh)
 
     if job_config.activation_checkpoint.mode != "none":
         apply_ac(model, job_config.activation_checkpoint)
@@ -95,11 +90,10 @@ def parallelize_llama(
             mode=dp_mode,
             ac_mode=job_config.activation_checkpoint.mode,
             mp_policy=mp_policy,
-            tp_mesh=tp_mesh if parallel_dims.tp_enabled else None,
         )
         logger.info("Applied Data Parallel (dp mode=%s) to the model", dp_mode)
 
-    if job_config.training.compile:
+    if job_config.compile.enable and "model" in job_config.compile.components:
         torch._inductor.config.reorder_for_peak_memory = False
         model = torch.compile(model, fullgraph=True)
 
