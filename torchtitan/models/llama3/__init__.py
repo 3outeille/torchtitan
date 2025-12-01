@@ -28,12 +28,12 @@ __all__ = [
 
 llama3_args = {
     "tinymodel": TransformerModelArgs(
-        dim=64,          # Hidden dimension (default: 4096)
-        n_layers=2,      # Number of transformer layers (default: 32)
-        n_heads=4,       # Attention heads (default: 32)
-        n_kv_heads=2,    # KV heads for GQA (default: None = same as n_heads)
-        vocab_size=512,  # Vocabulary size (default: 128256)
-        multiple_of=64,  # FFN hidden size multiple (default: 256)
+        dim=192,         # Good middle ground
+        n_layers=6,      # Match debugmodel depth
+        n_heads=12,      # 192/16 = 12 heads
+        n_kv_heads=4,    # GQA for efficiency
+        vocab_size=512,
+        multiple_of=64,
         rope_theta=500000
     ),
     "debugmodel": TransformerModelArgs(

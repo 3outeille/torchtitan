@@ -5,6 +5,28 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+#
+# Usage:
+#   ./run_train.sh [--debug] [additional args...]
+#
+# Modes:
+#   ./run_train.sh                  Normal training with torchrun
+#   ./run_train.sh --debug          Debug mode with debugpy-run (attach debugger)
+#
+# Environment variables:
+#   NGPU=<n>                        Number of GPUs (default: 8)
+#   LOG_RANK=<rank>                 Rank(s) to log (default: 0)
+#   CONFIG_FILE=<path>              Config file path (default: ./torchtitan/models/llama3/train_configs/debug_model.toml)
+#   COMM_MODE="fake_backend"        Dry run for config validation without GPU
+#   COMM_MODE="local_tensor"        Local tensor debugging mode
+#
+# Examples:
+#   ./run_train.sh                              # Normal training
+#   ./run_train.sh --debug                      # With debugpy
+#   NGPU=4 ./run_train.sh                       # Use 4 GPUs
+#   COMM_MODE="fake_backend" ./run_train.sh    # Validate config without GPU
+#
+
 set -ex
 
 # use envs as local overwrites for convenience
@@ -21,21 +43,34 @@ COMM_MODE=${COMM_MODE:-""}
 
 TORCHFT_LIGHTHOUSE=${TORCHFT_LIGHTHOUSE:-"http://localhost:29510"}
 
+# Check for --debug flag
+DEBUG_MODE=false
+ARGS=()
+for arg in "$@"; do
+    if [ "$arg" = "--debug" ]; then
+        DEBUG_MODE=true
+    else
+        ARGS+=("$arg")
+    fi
+done
+
 if [ -n "$COMM_MODE" ]; then
     # Communication mode specified: validate configuration or run in debug mode
     echo "Running with comm_mode=${COMM_MODE}"
-    NGPU="${NGPU}" LOCAL_RANK=0 python3 -m "${TRAIN_FILE}" --job.config_file "${CONFIG_FILE}" "$@" --comm.mode=${COMM_MODE} --training.steps=1
-else
-    # Normal training with torchrun
-    # PYTORCH_ALLOC_CONF="expandable_segments:True" \
-    # TORCHFT_LIGHTHOUSE=${TORCHFT_LIGHTHOUSE} \
-    # torchrun --nproc_per_node=${NGPU} --rdzv_backend c10d --rdzv_endpoint="localhost:0" \
-    # --local-ranks-filter ${LOG_RANK} --role rank --tee 3 \
-    # -m ${TRAIN_FILE} --job.config_file ${CONFIG_FILE} "$@"
-
+    NGPU="${NGPU}" LOCAL_RANK=0 python3 -m "${TRAIN_FILE}" --job.config_file "${CONFIG_FILE}" "${ARGS[@]}" --comm.mode=${COMM_MODE} --training.steps=1
+elif [ "$DEBUG_MODE" = true ]; then
+    # Debug mode with debugpy
+    echo "Running in debug mode with debugpy"
     PYTORCH_ALLOC_CONF="expandable_segments:True" \
     TORCHFT_LIGHTHOUSE=${TORCHFT_LIGHTHOUSE} \
     debugpy-run -m torch.distributed.run -- --nproc_per_node=${NGPU} --rdzv_backend c10d --rdzv_endpoint="localhost:0" \
     --local-ranks-filter ${LOG_RANK} --role rank --tee 3 \
-    -m ${TRAIN_FILE} --job.config_file ${CONFIG_FILE} "$@"
+    -m ${TRAIN_FILE} --job.config_file ${CONFIG_FILE} "${ARGS[@]}"
+else
+    # Normal training with torchrun
+    PYTORCH_ALLOC_CONF="expandable_segments:True" \
+    TORCHFT_LIGHTHOUSE=${TORCHFT_LIGHTHOUSE} \
+    torchrun --nproc_per_node=${NGPU} --rdzv_backend c10d --rdzv_endpoint="localhost:0" \
+    --local-ranks-filter ${LOG_RANK} --role rank --tee 3 \
+    -m ${TRAIN_FILE} --job.config_file ${CONFIG_FILE} "${ARGS[@]}"
 fi

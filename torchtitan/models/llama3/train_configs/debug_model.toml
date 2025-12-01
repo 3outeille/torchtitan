@@ -24,20 +24,20 @@ hf_assets_path = "./tests/assets/tokenizer_tiny"
 
 [optimizer]
 name = "AdamW"
-lr = 8e-4
+lr = 1e-3              # Slightly higher for small models
 eps = 1e-8
 
 [lr_scheduler]
-warmup_steps = 2
+warmup_steps = 10      # More warmup
 decay_ratio = 0.8
-decay_type = "linear"
+decay_type = "cosine"  # Smoother decay
 min_lr_factor = 0.0
 
 [training]
-local_batch_size = 2      # Smaller batch
-seq_len = 128             # Much shorter sequences
+local_batch_size = 4   # Larger batch for stability
+seq_len = 128
 max_norm = 1.0
-steps = 5
+steps = 50            # More steps to see convergence
 dataset = "c4_test"
 
 [parallelism]
