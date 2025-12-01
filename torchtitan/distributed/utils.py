@@ -311,13 +311,14 @@ def init_distributed(
         os.environ[env] = val
 
     def _get_distributed_backend(enable_cpu_backend):
-        backend = "nccl"
-        if device_type in torch.distributed.Backend.default_device_backend_map:
-            backend = torch.distributed.Backend.default_device_backend_map.get(
-                device_type
-            )
-        if enable_cpu_backend:
-            backend = f"{device_type}:{backend},cpu:gloo"
+        # backend = "nccl"
+        # if device_type in torch.distributed.Backend.default_device_backend_map:
+        #     backend = torch.distributed.Backend.default_device_backend_map.get(
+        #         device_type
+        #     )
+        # if enable_cpu_backend:
+        #     backend = f"{device_type}:{backend},cpu:gloo"
+        backend = "gloo"    
         return backend
 
     TRACE_BUFFER_SIZE = "TORCH_FR_BUFFER_SIZE"
@@ -367,7 +368,10 @@ def set_pg_timeouts(timeout, world_mesh):
     # otherwise, some ranks may issue collectives with the new/shorter timeout and
     # those may time out, before other ranks have finished with initialization done
     # under the old/slow timeout.
-    torch.distributed.barrier(device_ids=[device_module.current_device()])
+    if device_type == "cuda":
+        torch.distributed.barrier(device_ids=[device_module.current_device()])
+    else:
+        torch.distributed.barrier()
     device_module.synchronize()
 
     groups = [world_mesh.get_group(mesh_dim) for mesh_dim in range(world_mesh.ndim)]
