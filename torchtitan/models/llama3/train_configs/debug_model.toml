@@ -37,7 +37,7 @@ min_lr_factor = 0.0
 local_batch_size = 4   # Larger batch for stability
 seq_len = 128
 max_norm = 1.0
-steps = 50            # More steps to see convergence
+steps = 30            # More steps to see convergence
 dataset = "c4_test"
 
 [parallelism]

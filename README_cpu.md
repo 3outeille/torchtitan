@@ -15,6 +15,7 @@ uv pip install debugpy-run
 git checkout epita-exam
 python create_tiny_tokenizer.py 
 ./run_train.sh
+# ./run_train.sh --debug
 ```
 
 # TODO:
@@ -22,3 +23,5 @@ python create_tiny_tokenizer.py
 - Faire test suite
     - préparer `my_train.py`
     - script comparison diff loss/grad_norm
+    - add determinism to eeach run
+    - add tp + fsdp tests

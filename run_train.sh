@@ -7,11 +7,13 @@
 
 #
 # Usage:
-#   ./run_train.sh [--debug] [additional args...]
+#   ./run_train.sh [--debug] [--ref] [additional args...]
 #
 # Modes:
-#   ./run_train.sh                  Normal training with torchrun
+#   ./run_train.sh                  Normal training with your implementation (my_train.py)
+#   ./run_train.sh --ref            Normal training with reference implementation (train.py)
 #   ./run_train.sh --debug          Debug mode with debugpy-run (attach debugger)
+#   ./run_train.sh --debug --ref    Debug mode with reference implementation
 #
 # Environment variables:
 #   NGPU=<n>                        Number of GPUs (default: 8)
@@ -37,7 +39,6 @@ set -ex
 NGPU=${NGPU:-"8"}
 export LOG_RANK=${LOG_RANK:-0}
 CONFIG_FILE=${CONFIG_FILE:-"./torchtitan/models/llama3/train_configs/debug_model.toml"}
-TRAIN_FILE=${TRAIN_FILE:-"torchtitan.train"}
 # COMM_MODE options: "fake_backend" (dry run), "local_tensor" (debug mode), or empty for normal training
 COMM_MODE=${COMM_MODE:-""}
 
@@ -45,32 +46,42 @@ TORCHFT_LIGHTHOUSE=${TORCHFT_LIGHTHOUSE:-"http://localhost:29510"}
 
 # Check for --debug flag
 DEBUG_MODE=false
+USE_REF=false
 ARGS=()
 for arg in "$@"; do
     if [ "$arg" = "--debug" ]; then
         DEBUG_MODE=true
+    elif [ "$arg" = "--ref" ]; then
+        USE_REF=true
     else
         ARGS+=("$arg")
     fi
 done
 
-if [ -n "$COMM_MODE" ]; then
-    # Communication mode specified: validate configuration or run in debug mode
-    echo "Running with comm_mode=${COMM_MODE}"
-    NGPU="${NGPU}" LOCAL_RANK=0 python3 -m "${TRAIN_FILE}" --job.config_file "${CONFIG_FILE}" "${ARGS[@]}" --comm.mode=${COMM_MODE} --training.steps=1
-elif [ "$DEBUG_MODE" = true ]; then
+# Select training file based on --ref flag
+if [ "$USE_REF" = true ]; then
+    TRAIN_FILE=${TRAIN_FILE:-"torchtitan.train"}
+    echo "Using reference implementation (train.py)"
+    LOG_FILE=${LOG_FILE:-"log_train.txt"}
+else
+    TRAIN_FILE=${TRAIN_FILE:-"torchtitan.my_train"}
+    echo "Using your implementation (my_train.py)"
+    LOG_FILE=${LOG_FILE:-"log_my_train.txt"}
+fi
+
+if [ "$DEBUG_MODE" = true ]; then
     # Debug mode with debugpy
     echo "Running in debug mode with debugpy"
     PYTORCH_ALLOC_CONF="expandable_segments:True" \
     TORCHFT_LIGHTHOUSE=${TORCHFT_LIGHTHOUSE} \
     debugpy-run -m torch.distributed.run -- --nproc_per_node=${NGPU} --rdzv_backend c10d --rdzv_endpoint="localhost:0" \
     --local-ranks-filter ${LOG_RANK} --role rank --tee 3 \
-    -m ${TRAIN_FILE} --job.config_file ${CONFIG_FILE} "${ARGS[@]}"
+    -m ${TRAIN_FILE} --job.config_file ${CONFIG_FILE} "${ARGS[@]}" 2>&1 | tee ${LOG_FILE}
 else
     # Normal training with torchrun
     PYTORCH_ALLOC_CONF="expandable_segments:True" \
     TORCHFT_LIGHTHOUSE=${TORCHFT_LIGHTHOUSE} \
     torchrun --nproc_per_node=${NGPU} --rdzv_backend c10d --rdzv_endpoint="localhost:0" \
     --local-ranks-filter ${LOG_RANK} --role rank --tee 3 \
-    -m ${TRAIN_FILE} --job.config_file ${CONFIG_FILE} "${ARGS[@]}"
+    -m ${TRAIN_FILE} --job.config_file ${CONFIG_FILE} "${ARGS[@]}" 2>&1 | tee ${LOG_FILE}
 fi
