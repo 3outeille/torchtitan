@@ -11,7 +11,15 @@ from typing import Protocol
 import torch
 import torch.nn as nn
 
+from torch.nn.attention.flex_attention import BlockMask
+
+from torchtitan.components.tokenizer import BaseTokenizer
+
 from torchtitan.config import JobConfig
+from torchtitan.models.attention import VarlenMetadata
+
+
+AttentionMasksType = dict[str, BlockMask] | BlockMask | VarlenMetadata
 
 
 @dataclass
@@ -53,3 +61,13 @@ class ModelProtocol(Protocol):
             buffer_device: Optional device to place buffers on during initialization.
         """
         pass
+
+    def get_attention_masks(
+        self,
+        input_batch: torch.Tensor,
+        tokenizer: BaseTokenizer,
+        extra_inputs: dict[str, torch.Tensor] | None = None,
+    ) -> AttentionMasksType:
+        raise NotImplementedError(
+            "This model does not support attention masking/Flex Attention."
+        )

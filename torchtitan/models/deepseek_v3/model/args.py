@@ -13,7 +13,8 @@ from torch import nn
 
 from torchtitan.config import JobConfig
 from torchtitan.models.moe import MoEArgs
-from torchtitan.protocols.train_spec import BaseModelArgs
+from torchtitan.models.utils import get_moe_model_nparams_and_flops
+from torchtitan.protocols.model import BaseModelArgs
 from torchtitan.tools.logging import logger
 from torchtitan.tools.utils import has_cuda_capability
 
@@ -43,7 +44,7 @@ class DeepSeekV3ModelArgs(BaseModelArgs):
         qk_nope_head_dim (int): Dimension for query-key projections without positional embeddings.
         qk_rope_head_dim (int): Dimension for query-key projections with rotary embeddings.
         v_head_dim (int): Dimension for value projections.
-        use_flex_attn (bool): Whether to use FlexAttention.
+        attn_type (str): Attention type.
         attn_mask_type (str): Type of attention mask.
         original_seq_len (int): Original sequence length.
         rope_theta (float): Base for rotary positional encoding.
@@ -75,7 +76,7 @@ class DeepSeekV3ModelArgs(BaseModelArgs):
     qk_nope_head_dim: int = 128
     qk_rope_head_dim: int = 64
     v_head_dim: int = 128
-    use_flex_attn: bool = False
+    attn_type: str = "sdpa"
     attn_mask_type: str = "causal"
 
     # yarn
@@ -100,62 +101,19 @@ class DeepSeekV3ModelArgs(BaseModelArgs):
             )
             self.moe_args.use_grouped_mm = False
 
-        if job_config.parallelism.context_parallel_degree > 1 and self.use_flex_attn:
-            raise NotImplementedError(
-                "CP support for FlexAttention is still in progress."
-            )
+        if job_config.parallelism.context_parallel_degree > 1 and attn_type != "sdpa":
+            raise NotImplementedError("CP support is only supported for SDPA.")
 
-    def get_nparams_and_flops(self, model: nn.Module, seq_len: int) -> tuple[int, int]:
-        """
-        Adopted from llama4 implementation.
-        """
-        nparams_embedding = 0
-        nparams_moe_router = 0
-        nparams_shared_experts = 0
-        nparams_experts = 0
-        nparams_dense = 0
-
-        for name, p in model.named_parameters():
-            if "embedding" in name:
-                nparams_embedding += p.numel()
-                nparams_dense += p.numel()
-            elif "moe.shared_experts" in name:
-                nparams_shared_experts += p.numel()
-            elif "moe.router" in name:
-                nparams_moe_router += p.numel()
-            elif "moe.experts" in name:
-                nparams_experts += p.numel()
-            else:
-                nparams_dense += p.numel()
-
-        nparams_sparse = nparams_moe_router + nparams_shared_experts + nparams_experts
-        nparams = nparams_dense + nparams_sparse
-        nparams_sparse_active = (
-            nparams_moe_router
-            + nparams_shared_experts
-            + nparams_experts * self.moe_args.top_k // self.moe_args.num_experts
+        self.moe_args._debug_force_load_balance = (
+            job_config.debug.moe_force_load_balance
         )
 
-        logger.info(
-            f"Total parameter count: dense {nparams_dense:,}, "
-            f"sparse {nparams_sparse:,}, active {nparams_dense + nparams_sparse_active:,}"
-        )
-
-        l, h, q, t = (
-            self.n_layers,
-            self.n_heads,
-            self.dim // self.n_heads,
+    def get_nparams_and_flops(
+        self, model: nn.Module, seq_len: int
+    ) -> tuple[int, float]:
+        return get_moe_model_nparams_and_flops(
+            self,
+            model,
+            self.qk_nope_head_dim + self.qk_rope_head_dim + self.v_head_dim,
             seq_len,
         )
-        # Reasoning behind the factor of 12 for the self-attention part of the formula:
-        # 1. each self-attention has 2 matmul in the forward and 4 in the backward (6)
-        # 2. the flash attention does 1 more matmul recomputation in the backward
-        #    but recomputation should not be counted in calculating MFU           (+0)
-        # 3. each matmul performs 1 multiplication and 1 addition                 (*2)
-        # 4. we follow the convention and do not account for sparsity in causal attention
-        num_flops_per_token = (
-            6 * (nparams_dense - nparams_embedding + nparams_sparse_active)
-            + 12 * l * h * q * t
-        )
-
-        return nparams, num_flops_per_token

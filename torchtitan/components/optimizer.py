@@ -16,6 +16,7 @@ from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
 )
 from torch.distributed.checkpoint.stateful import Stateful
+from torch.distributed.tensor import Replicate
 from torch.optim import Optimizer
 
 from torchtitan.components.ft import FTManager, has_torchft
@@ -340,6 +341,14 @@ def build_optimizers_with_moe_load_balancing(
         ft_manager=ft_manager,
     )
 
+    def _should_register_moe_balancing_hook(model_parts: list[nn.Module]) -> bool:
+        for model_part in model_parts:
+            for transformer_block in model_part.layers.values():
+                if transformer_block.moe_enabled:
+                    # Assumption: load_balance_coeff is set universally on all moe blocks.
+                    return bool(transformer_block.moe.load_balance_coeff)
+        return False
+
     # for MoE auxiliary-loss-free load balancing
     def _is_recomputation_enabled(module):
         return getattr(module, "checkpoint_impl", None) is CheckpointImpl.NO_REENTRANT
@@ -372,11 +381,19 @@ def build_optimizers_with_moe_load_balancing(
         tokens_per_expert_by_layer = torch.vstack(tokens_per_expert_list)
 
         if dp_cp_mesh is not None:
-            # Perform single all-reduce to get global statistics across all processes
-            pg = dp_cp_mesh.get_group()
-            torch.distributed.all_reduce(
-                tokens_per_expert_by_layer, group=pg, op=torch.distributed.ReduceOp.SUM
-            )
+            if isinstance(tokens_per_expert_by_layer, torch.distributed.tensor.DTensor):
+                tokens_per_expert_by_layer = tokens_per_expert_by_layer.redistribute(
+                    placements=[Replicate()]
+                    * tokens_per_expert_by_layer.device_mesh.ndim
+                )
+            else:
+                # Perform single all-reduce to get global statistics across all processes
+                pg = dp_cp_mesh.get_group()
+                torch.distributed.all_reduce(
+                    tokens_per_expert_by_layer,
+                    group=pg,
+                    op=torch.distributed.ReduceOp.SUM,
+                )
 
         moe_layer_idx = 0
         with torch.no_grad():
@@ -400,10 +417,11 @@ def build_optimizers_with_moe_load_balancing(
                     moe.expert_bias.add_(expert_bias_delta)
                     moe.tokens_per_expert.zero_()
 
-    optimizers.register_step_pre_hook(
-        lambda *args, **kwargs: _update_expert_bias(
-            model_parts, parallel_dims=parallel_dims
+    if _should_register_moe_balancing_hook(model_parts):
+        optimizers.register_step_pre_hook(
+            lambda *args, **kwargs: _update_expert_bias(
+                model_parts, parallel_dims=parallel_dims
+            )
         )
-    )
 
     return optimizers

@@ -19,9 +19,9 @@ import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 import torch.nn as nn
-from torch.distributed.checkpoint import (
-    HuggingFaceStorageReader,
-    HuggingFaceStorageWriter,
+from torch.distributed.checkpoint import HuggingFaceStorageWriter
+from torch.distributed.checkpoint._consolidate_hf_safetensors import (
+    consolidate_safetensors_files_on_every_rank,
 )
 from torch.distributed.checkpoint.staging import DefaultStager, StagingOptions
 from torch.distributed.checkpoint.state_dict import (
@@ -187,10 +187,32 @@ class CheckpointManager:
         ft_manager: FTManager | None = None,
     ) -> None:
         self.enable = checkpoint_config.enable
+        self.load_only = checkpoint_config.load_only
+
+        self.states = states
+        self.states.update(
+            {
+                MODEL: ModelWrapper(model_parts),
+                OPTIMIZER: optimizers,
+                DATALOADER: dataloader,
+                LR_SCHEDULER: lr_schedulers,
+            }
+        )
 
         self.ft_manager = (
             ft_manager.manager if ft_manager and ft_manager.enabled else None
         )
+
+        self.enable_ft_dataloader_checkpoints = (
+            self.ft_manager and checkpoint_config.enable_ft_dataloader_checkpoints
+        )
+
+        if self.ft_manager and not self.enable_ft_dataloader_checkpoints:
+            logger.warn(
+                "Fault tolerance is enabled but enable_ft_dataloader_checkpoints is False. "
+                "This means replicas can retrain over the same data multiple times, which can result in overfitting."
+            )
+
         if self.ft_manager:
             optimizers.init_cache_state_dict()
 
@@ -217,20 +239,11 @@ class CheckpointManager:
         async_mode = checkpoint_config.async_mode.lower()
         self.enable_staging = (
             self.enable and async_mode == AsyncMode.ASYNC_WITH_PINNED_MEM
-        ) or self.ft_manager
+        ) or self.enable_ft_dataloader_checkpoints
 
-        if not self.enable and self.ft_manager is None:
+        if not self.enable and not self.enable_ft_dataloader_checkpoints:
             return
 
-        self.states = states
-        self.states.update(
-            {
-                MODEL: ModelWrapper(model_parts),
-                OPTIMIZER: optimizers,
-                DATALOADER: dataloader,
-                LR_SCHEDULER: lr_schedulers,
-            }
-        )
         self.ft_states = {DATALOADER: dataloader}
 
         self.staging = False
@@ -245,6 +258,9 @@ class CheckpointManager:
         self.initial_load_model_only = checkpoint_config.initial_load_model_only
         self.initial_load_in_hf = checkpoint_config.initial_load_in_hf
         self.initial_load_path = checkpoint_config.initial_load_path
+        self.initial_load_in_hf_quantized = (
+            checkpoint_config.initial_load_in_hf_quantized
+        )
         self.last_save_model_only = checkpoint_config.last_save_model_only
         self.last_save_in_hf = checkpoint_config.last_save_in_hf
         if self.last_save_in_hf:
@@ -264,7 +280,7 @@ class CheckpointManager:
         if (
             async_mode == AsyncMode.ASYNC
             or async_mode == AsyncMode.ASYNC_WITH_PINNED_MEM
-            or self.ft_manager
+            or self.enable_ft_dataloader_checkpoints
         ):
             self.pg = dist.new_group(backend="gloo")
 
@@ -352,14 +368,23 @@ class CheckpointManager:
             state_dict = self.sd_adapter.to_hf(state_dict)
 
             fqn_to_index_mapping = self.sd_adapter.fqn_to_index_mapping
-
-            storage_writer = HuggingFaceStorageWriter(
-                path=checkpoint_id,
-                save_distributed=True,
-                fqn_to_index_mapping=fqn_to_index_mapping,
-                enable_consolidation=True,
-                thread_count_consolidation=5,
-            )
+            if fqn_to_index_mapping:
+                storage_writer = HuggingFaceStorageWriter(
+                    path=os.path.join(checkpoint_id, "sharded"),
+                    save_distributed=True,
+                    fqn_to_index_mapping=fqn_to_index_mapping,
+                    enable_consolidation=False,
+                )
+            else:
+                # the reason for only enabling consolidation if there is
+                # no mapping is because no mapping implies that we save all fqns
+                # to one file. This means we only need one rank to consolidate.
+                # Otherwise we should use consolidate_safetensors_files_on_every_rank
+                storage_writer = HuggingFaceStorageWriter(
+                    path=checkpoint_id,
+                    save_distributed=True,
+                    enable_consolidation=True,
+                )
 
         else:
             checkpoint_save_id = checkpoint_id
@@ -387,6 +412,14 @@ class CheckpointManager:
                 checkpoint_id=checkpoint_save_id,
             )
 
+        if to_hf and self.sd_adapter.fqn_to_index_mapping:
+            consolidate_safetensors_files_on_every_rank(
+                input_dir=os.path.join(checkpoint_id, "sharded"),
+                output_dir=checkpoint_id,
+                fqn_to_index_mapping=self.sd_adapter.fqn_to_index_mapping,
+                num_threads=5,
+            )
+
         if enable_garbage_collection:
             GarbageCollection.collect("GC collection invoked by checkpointer.")
 
@@ -397,6 +430,7 @@ class CheckpointManager:
         state_dict: dict[str, Any],
         checkpoint_id: str,
         from_hf: bool,
+        from_quantized: bool,
     ) -> None:
         """Load the checkpoint with dcp.
         Args:
@@ -411,10 +445,13 @@ class CheckpointManager:
                 self.sd_adapter is not None
             ), "trying to load checkpoint in HF safetensors format, but sd_adapter is not provided."
             hf_state_dict = self.sd_adapter.to_hf(state_dict)
+            hf_storage_reader = self.sd_adapter.get_hf_storage_reader(
+                checkpoint_id, from_quantized
+            )
 
             dcp.load(
                 hf_state_dict,
-                storage_reader=HuggingFaceStorageReader(path=checkpoint_id),
+                storage_reader=hf_storage_reader,
             )
 
             state_dict = self.sd_adapter.from_hf(hf_state_dict)
@@ -444,14 +481,16 @@ class CheckpointManager:
             None
         """
 
-        if self.ft_manager:
+        if self.enable_ft_dataloader_checkpoints:
             self._ft_save(curr_step)
 
         if not self._should_save(curr_step, last_step):
             return
 
         begin = time.monotonic()
-        if not self.ft_manager or self.ft_manager.participating_rank() == 0:
+        if not self.enable_ft_dataloader_checkpoints or (
+            self.ft_manager and self.ft_manager.participating_rank() == 0
+        ):
             logger.info("Saving the checkpoint (or staging if async is enabled).")
             checkpoint_id = self._create_checkpoint_id(curr_step)
             self._async_wait()
@@ -474,6 +513,7 @@ class CheckpointManager:
                 )
                 self.save_future = result.upload_completion
                 self.staging_future = result.staging_completion
+                self.staging = True
             elif self.async_mode == AsyncMode.ASYNC:
                 GarbageCollection.collect("GC collection invoked by checkpointer.")
                 self.save_future = self.dcp_save(
@@ -493,7 +533,8 @@ class CheckpointManager:
                 "Finished saving the checkpoint (or staging if async is enabled)"
                 f"in {time.monotonic() - begin:.2f} seconds."
             )
-        elif self.ft_manager:
+        elif self.enable_ft_dataloader_checkpoints:
+            assert self.ft_manager is not None
             logger.info(
                 "Replica %d doesn't save checkpoint.",
                 self.ft_manager.participating_rank(),
@@ -514,7 +555,7 @@ class CheckpointManager:
             bool: Whether the checkpoint was loaded successfully.
         """
 
-        if self.ft_manager:
+        if self.enable_ft_dataloader_checkpoints:
             self._ft_load()
 
         if not self.enable:
@@ -522,13 +563,21 @@ class CheckpointManager:
 
         model_only = False
         from_hf = False
+        from_quantized = False
         if not os.path.exists(self.folder):
             model_only = self.initial_load_model_only
             from_hf = self.initial_load_in_hf
+            from_quantized = self.initial_load_in_hf_quantized
             if from_hf:
                 assert (
                     model_only
                 ), "Only model can be loaded when loading from HF's safetensors checkpoint."
+
+            if from_quantized:
+                assert (
+                    from_hf
+                ), "Quantized checkpoint can only be loaded from HuggingFace format."
+
             if self.initial_load_path:
                 checkpoint_id = self.initial_load_path
                 if not os.path.isdir(checkpoint_id):
@@ -580,6 +629,7 @@ class CheckpointManager:
             states,
             checkpoint_id=checkpoint_id,
             from_hf=from_hf,
+            from_quantized=from_quantized,
         )
         GarbageCollection.collect("GC collection for checkpoint loading.")
         logger.info(
@@ -595,6 +645,7 @@ class CheckpointManager:
         """
         if self.enable_staging and self.staging:
             self.staging_future.result()
+            self.staging = False
 
     def _find_load_step(self, folder: str = "") -> int:
         """Find the step to load the checkpoint for.
@@ -656,6 +707,7 @@ class CheckpointManager:
             checkpoint_id=checkpoint_id,
             # FT checkpoints are always DCP because FT checkpoint currently only save/load dataloader.
             from_hf=False,
+            from_quantized=False,
         )
         GarbageCollection.collect("GC collection for checkpoint loading.")
         logger.info(
@@ -701,7 +753,7 @@ class CheckpointManager:
 
         states_to_load = self._flattened_model_states_sd(states_to_load)
 
-        if self.ft_manager:
+        if self.enable_ft_dataloader_checkpoints:
             states_to_load.pop(DATALOADER)
 
         return states_to_load
@@ -739,7 +791,7 @@ class CheckpointManager:
         )
 
     def _should_save(self, curr_step: int, last_step: bool = False) -> bool:
-        if not self.enable:
+        if not self.enable or self.load_only:
             return False
 
         if curr_step == 1 and self.enable_first_step_checkpoint:
@@ -757,7 +809,9 @@ class CheckpointManager:
         if self.async_mode == AsyncMode.ASYNC_WITH_PINNED_MEM:
             if self.save_future is not None:
                 self.save_future.result()
-        elif self.async_mode == AsyncMode.ASYNC or self.ft_manager is not None:
+        elif (
+            self.async_mode == AsyncMode.ASYNC or self.enable_ft_dataloader_checkpoints
+        ):
             if self.save_future is not None:
                 self.save_future.result()
                 self.save_future = None
@@ -772,7 +826,10 @@ class CheckpointManager:
             self.keep_latest_k > 0
             and dist.get_rank() == 0
             and os.path.isdir(self.folder)
-            and (not self.ft_manager or self.ft_manager.participating_rank() == 0)
+            and (
+                not self.enable_ft_dataloader_checkpoints
+                or (self.ft_manager and self.ft_manager.participating_rank() == 0)
+            )
         ):
             discovered_checkpoints = []
             for filename in os.listdir(self.folder):

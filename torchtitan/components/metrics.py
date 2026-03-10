@@ -20,6 +20,13 @@ from torchtitan.tools import utils
 from torchtitan.tools.logging import logger
 from torchtitan.tools.utils import Color, device_module, device_type
 
+# Try to import psutil for CPU memory monitoring
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
+
 if TYPE_CHECKING:
     from torchtitan.protocols import BaseModelArgs
 
@@ -40,27 +47,66 @@ DeviceMemStats = namedtuple(
 
 class DeviceMemoryMonitor:
     def __init__(self, device: str = f"{device_type}:0"):
-        self.device = torch.device(device)  # device object
-        self.device_name = device_module.get_device_name(self.device)
-        self.device_index = device_module.current_device()
-        self.device_capacity = device_module.get_device_properties(
-            self.device
-        ).total_memory
-        self.device_capacity_gib = self._to_gib(self.device_capacity)
-
-        device_module.reset_peak_memory_stats()
-        device_module.empty_cache()
+        self.device = torch.device(device)
+        self.is_cpu = self.device.type == "cpu"
+        
+        if self.is_cpu:
+            self.device_name = "CPU"
+            self.device_index = 0
+            if HAS_PSUTIL:
+                self.device_capacity = psutil.virtual_memory().total
+            else:
+                self.device_capacity = 0
+            self.device_capacity_gib = self._to_gib(self.device_capacity)
+            self._peak_memory = 0
+            self._process = psutil.Process(os.getpid()) if HAS_PSUTIL else None
+        else:
+            self.device_name = device_module.get_device_name(self.device)
+            self.device_index = device_module.current_device()
+            self.device_capacity = device_module.get_device_properties(
+                self.device
+            ).total_memory
+            self.device_capacity_gib = self._to_gib(self.device_capacity)
+            device_module.reset_peak_memory_stats()
+            device_module.empty_cache()
 
     def _to_gib(self, memory_in_bytes):
-        # NOTE: GiB (gibibyte) is 1024, vs GB is 1000
         _gib_in_bytes = 1024 * 1024 * 1024
         memory_in_gib = memory_in_bytes / _gib_in_bytes
         return memory_in_gib
 
     def _to_pct(self, memory):
+        if self.device_capacity == 0:
+            return 0
         return 100 * memory / self.device_capacity
 
+    def _update_cpu_peak(self):
+        """Track peak CPU memory usage."""
+        if self._process is not None:
+            current = self._process.memory_info().rss  # Resident Set Size
+            self._peak_memory = max(self._peak_memory, current)
+
     def get_peak_stats(self):
+        if self.is_cpu:
+            if not HAS_PSUTIL:
+                logger.warning("psutil not installed, CPU memory tracking disabled")
+                return DeviceMemStats(0, 0, 0, 0, 0, 0)
+            
+            self._update_cpu_peak()
+            # For CPU, rss is like "reserved" memory
+            max_reserved = self._peak_memory
+            max_reserved_gib = self._to_gib(max_reserved)
+            max_reserved_pct = self._to_pct(max_reserved)
+            
+            return DeviceMemStats(
+                max_active_gib=max_reserved_gib,  # Same as reserved for CPU
+                max_active_pct=max_reserved_pct,
+                max_reserved_gib=max_reserved_gib,
+                max_reserved_pct=max_reserved_pct,
+                num_alloc_retries=0,
+                num_ooms=0,
+            )
+        
         device_info = device_module.memory_stats(self.device)
 
         max_active = device_info.get("active_bytes.all.peak", -1)
@@ -91,7 +137,10 @@ class DeviceMemoryMonitor:
         )
 
     def reset_peak_stats(self):
-        device_module.reset_peak_memory_stats()
+        if self.is_cpu:
+            self._peak_memory = 0
+        else:
+            device_module.reset_peak_memory_stats()
 
 
 def build_device_memory_monitor():
@@ -162,6 +211,28 @@ class WandBLogger(BaseLogger):
     def close(self) -> None:
         if self.wandb.run is not None:
             self.wandb.finish()
+
+
+class LoggerContainer(BaseLogger):
+    """Container to call all loggers enabled in the job config."""
+
+    def __init__(self) -> None:
+        self._loggers: list[BaseLogger] = []
+
+    def add_logger(self, logger_instance: BaseLogger) -> None:
+        self._loggers.append(logger_instance)
+
+    def log(self, metrics: dict[str, Any], step: int) -> None:
+        for logger_instance in self._loggers:
+            logger_instance.log(metrics, step)
+
+    @property
+    def number_of_loggers(self) -> int:
+        return len(self._loggers)
+
+    def close(self) -> None:
+        for logger_instance in self._loggers:
+            logger_instance.close()
 
 
 def ensure_pp_loss_visible(
@@ -274,11 +345,15 @@ def _build_metric_logger(
             base_log_dir, f"rank_{torch.distributed.get_rank()}"
         )
 
+    # Create logger container
+    logger_container = LoggerContainer()
+
     # Create loggers in priority order
     if metrics_config.enable_wandb:
         logger.debug("Attempting to create WandB logger")
         try:
-            return WandBLogger(base_log_dir, job_config, tag)
+            wandb_logger = WandBLogger(base_log_dir, job_config, tag)
+            logger_container.add_logger(wandb_logger)
         except Exception as e:
             if "No module named 'wandb'" in str(e):
                 logger.error(
@@ -289,10 +364,12 @@ def _build_metric_logger(
 
     if metrics_config.enable_tensorboard:
         logger.debug("Creating TensorBoard logger")
-        return TensorBoardLogger(base_log_dir, tag)
+        tensorboard_logger = TensorBoardLogger(base_log_dir, tag)
+        logger_container.add_logger(tensorboard_logger)
 
-    logger.debug("No loggers enabled, returning BaseLogger")
-    return BaseLogger()
+    if logger_container.number_of_loggers == 0:
+        logger.debug("No loggers enabled, returning an empty LoggerContainer")
+    return logger_container
 
 
 class MetricsProcessor:
